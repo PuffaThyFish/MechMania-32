@@ -3,7 +3,7 @@ import math
 from . import *
 
 # -------------------------------------------------------------------------------------
-# Heal-chain payload stall -- v4
+# Heal-chain payload stall -- v5
 #
 # The plan:
 #   1. One Battle bot ("the tank") heads straight for the payload and parks in the
@@ -15,10 +15,19 @@ from . import *
 #   2. 3 Healers (layer 1) go heal the tank, fanned out on separate rays around it so
 #      they stay `SAFE_SPACING` apart. `heal_stack_cap` is 3.0, i.e. exactly 3 healers'
 #      worth of healing lands on one target -- a 4th on the same bot would be wasted.
+#      The fan points away from wherever the payload is currently *heading*, not a
+#      fixed world direction -- see `formation_back` -- so the chain does not end up on
+#      the wrong side of the tank once the payload's path rounds a corner.
 #   3. 5 Extractors mine our own deposit, placed by searching for spots that actually
-#      have a clear shot at it rather than assuming a fixed offset is clear.
-#   4. 9 more Healers (layer 2), 3 per layer-1 healer, fanned the same way around their
-#      own parent -- so each layer-1 healer is protected by a full 3-healer stack.
+#      have a clear shot at it rather than assuming a fixed offset is clear. If enemies
+#      show up at the deposit, extractors flee rather than feed free kills; a small raid
+#      (<= 2) gets matched by a temporary defense force pulled from standby, one bigger
+#      than the raid; a bigger assault gets the deposit abandoned outright -- no more
+#      extractors built while it holds, existing ones retreat, and the fabricator spends
+#      that capacity on Battle/Healer bots instead.
+#   4. 9 more Healers (layer 2), 3 per layer-1 healer, fanned the same way (and in the
+#      same direction) around their own parent -- so each layer-1 healer is protected by
+#      a full 3-healer stack.
 #   5. Everything built after that is a Battle bot on standby. Layer 1 gets kept alive
 #      by layer 2's healing, but nothing heals layer 2 itself -- so standby bodyguards
 #      split between guarding the tank directly (close range, anti-rush) and guarding
@@ -36,8 +45,10 @@ from . import *
 #      outside the tank-heal-tree entirely (layer 1 <- tank, layer 2 <- layer 1).
 #
 # Still a first pass: role assignment is by rank (Nth-smallest id within a class), not a
-# persistent assignment, so a dead tank/healer is transparently replaced by whichever
-# surviving bot of that class now has the lowest id.
+# persistent assignment (except the healer sub-roles -- see `_healer_roles` -- which
+# specifically need it since layer 2 is a position, not just a label), so a dead
+# tank/healer is transparently replaced by whichever surviving bot of that class now has
+# the lowest id.
 
 TANK_COUNT = 1
 HEALER_LAYER_1 = 3
@@ -47,10 +58,13 @@ HEALER_TOTAL = HEALER_LAYER_1 + HEALER_LAYER_2  # 12
 GENERAL_HEALER_COUNT = 2  # extra floating healers, built only after extraction retires
 TANK_GUARD_COUNT = 4  # of the standby Battle bots, how many stay glued to the tank
 FOCUS_GROUP_SIZE = 4  # tank guards commit to one shared target per group this size
+SMALL_RAID_MAX = 2  # deposit threats at or below this get matched; above it, abandon
+CAPTURE_TANGENT_DELTA = 0.01  # capture-progress step used to sample the payload's heading
 
-# `LEFT` is the healer fan's general heading -- away from the payload, toward the map
-# edge. Every unit sees itself as bottom-left (the engine mirrors team B's world), so
-# "the left edge" means the same thing regardless of which side we actually are.
+# `LEFT` is the fallback formation heading for the rare tick where the payload's local
+# direction of travel cannot be sampled (see `formation_back`). Every unit sees itself
+# as bottom-left (the engine mirrors team B's world), so a fixed "toward the map edge"
+# fallback means the same thing regardless of which side we actually are.
 # `RIGHT` is just a zero-degree reference for the full-circle placements (the guard
 # rings, the extractor search), which have no preferred heading.
 LEFT = Vec2(-1.0, 0.0)
@@ -89,18 +103,18 @@ def get_strategy(team: int) -> Strategy:
     return heal_chain_strategy
 
 
-def _next_build_class(battle_count: int, healer_count: int, extractor_count: int, extraction_retired: bool) -> BotClass:
+def _next_build_class(battle_count: int, healer_count: int, extractor_count: int, extraction_retired: bool, deposit_safe: bool) -> BotClass:
     """The fabricator build order for this strategy, checked as a priority list: tank
-    first, then the first healer layer, then extractors (unless retired -- see
-    `heal_chain_strategy`), then the second healer layer, then -- once extraction has
-    retired -- the 2 general healers, then Battle bots for as long as the fabricator
-    keeps firing."""
+    first, then the first healer layer, then extractors (unless retired, or the deposit
+    is under a heavy assault we have decided to abandon -- see `heal_chain_strategy`),
+    then the second healer layer, then -- once extraction has retired -- the 2 general
+    healers, then Battle bots for as long as the fabricator keeps firing."""
 
     if battle_count < TANK_COUNT:
         return BotClass.Battle
     if healer_count < HEALER_LAYER_1:
         return BotClass.Healer
-    if not extraction_retired and extractor_count < EXTRACTOR_COUNT:
+    if not extraction_retired and deposit_safe and extractor_count < EXTRACTOR_COUNT:
         return BotClass.Extractor
     if healer_count < HEALER_TOTAL:
         return BotClass.Healer
@@ -109,8 +123,8 @@ def _next_build_class(battle_count: int, healer_count: int, extractor_count: int
     return BotClass.Battle
 
 
-def _fan_directions(count: int, radius: float, spacing: float) -> List[Vec2]:
-    """`count` unit directions fanned out around `LEFT`, spread wide enough that two
+def _fan_directions(center: Vec2, count: int, radius: float, spacing: float) -> List[Vec2]:
+    """`count` unit directions fanned out around `center`, spread wide enough that two
     points both sitting at `radius` along adjacent directions are still `spacing` apart.
 
     Used for both healer layers: layer 1 fans around the tank, and each layer-2 group
@@ -125,9 +139,35 @@ def _fan_directions(count: int, radius: float, spacing: float) -> List[Vec2]:
     rays `angle` degrees apart; solved for `angle` given the chord we want (`spacing`).
     """
     if count <= 1 or radius <= 0.0:
-        return [LEFT for _ in range(count)]
+        return [center for _ in range(count)]
     step_deg = math.degrees(2.0 * math.asin(min(1.0, spacing / (2.0 * radius))))
-    return [LEFT.rotate_deg(step_deg * (i - (count - 1) / 2.0)) for i in range(count)]
+    return [center.rotate_deg(step_deg * (i - (count - 1) / 2.0)) for i in range(count)]
+
+
+def _formation_back(state: GameState) -> Vec2:
+    """Which way is "behind" the payload right now, i.e. the direction the healer chain
+    should extend in -- the opposite of the payload's current direction of travel along
+    its own path, not a fixed world-space heading.
+
+    A fixed heading (say, always toward the map edge) is only "away from the fight" for
+    as long as the payload happens to be moving in the one direction that heading
+    actually points away from. `conf.payload_path` bends -- team A's push goes right,
+    then down, then left, then down again -- so a fixed heading eventually points
+    *toward* where the payload is going instead of away from it, and the chain ends up
+    on the wrong side once the payload rounds that corner.
+
+    Samples the path's own local tangent instead: `payload_pos` gives the payload's
+    position at any capture value, so nudging capture slightly forward and slightly
+    back and taking the direction between those two points is the direction of travel
+    *right here*, whatever segment of the path this is. The chain faces the opposite of
+    that. Falls back to `LEFT` only in the degenerate case of both samples landing on
+    the same point (the very ends of the path, where the match is also about to end on
+    a payload win anyway).
+    """
+    ahead = payload_pos(min(1.0, state.capture + CAPTURE_TANGENT_DELTA))
+    behind = payload_pos(max(-1.0, state.capture - CAPTURE_TANGENT_DELTA))
+    back = (behind - ahead).normalize_or_zero()
+    return back if back.norm_sq() > 0.0 else LEFT
 
 
 def _ring_positions(center: Vec2, count: int, radius: float) -> List[Vec2]:
@@ -244,8 +284,9 @@ def _engage_if_possible(bot_action: BotAction, bot_pos: Vec2, enemies, blaster_r
     """A single Battle bot's combat behavior: if there is a target in range with a
     clear shot, turn onto it and fire, overriding whatever facing its positional job
     would otherwise want. Used directly by bots not coordinating as a group (the tank,
-    the layer-2 guards), and as the tank guards' fallback when their group's shared
-    target is not actually reachable from their own exact position."""
+    the layer-2 guards, the deposit defense force), and as the tank guards' fallback
+    when their group's shared target is not actually reachable from their own exact
+    position."""
     target = _find_target(bot_pos, enemies, blaster_range)
     if target is None:
         return False
@@ -294,6 +335,7 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     conf = get_config()
     action = FleetAction.new()
     payload = state.payload_pos()
+    back = _formation_back(state)
 
     battle_bots = sorted((b for b in state.fleet_me if b.class_ == BotClass.Battle), key=lambda b: b.id)
     healer_bots = sorted((b for b in state.fleet_me if b.class_ == BotClass.Healer), key=lambda b: b.id)
@@ -326,6 +368,28 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     # heading for the tank to taking its own exact spot.
     chain_reach = 2.0 * heal_max_dist
 
+    # --- deposit defense: figure out who, if anyone, is threatening our extraction
+    # point before deciding what the extractors and the fabricator do this tick. An
+    # enemy within our own blaster range of the deposit can already shoot anything
+    # mining there. A small raid (<= SMALL_RAID_MAX) gets matched by a temporary strike
+    # force one bigger than it, pulled out of standby; anything larger and we cut our
+    # losses -- no new extractors while it holds, and the fabricator's capacity goes to
+    # Battle/Healer bots instead. ---
+    deposit_threats = [e for e in state.fleet_other
+                        if state.deposit_me.pos.dist_sq(e.pos) <= conf.bot.blaster_range ** 2]
+    threat_count = len(deposit_threats)
+    deposit_contested = threat_count > 0
+    deposit_under_heavy_assault = threat_count > SMALL_RAID_MAX
+    if deposit_contested and not deposit_under_heavy_assault:
+        needed_defenders = min(threat_count + 1, len(standby_battle))
+    else:
+        needed_defenders = 0
+
+    deposit_defenders: List[BotState] = []
+    if needed_defenders:
+        deposit_defenders = standby_battle[-needed_defenders:]
+        standby_battle = standby_battle[:len(standby_battle) - needed_defenders]
+
     # --- the tank: hold (and, while uncontested, push) the payload ---
     if tank is not None:
         bot_action = action.bots[tank.id]
@@ -333,10 +397,12 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
         bot_action.turn_action = turn_towards(payload)
         _engage_if_possible(bot_action, tank.pos, state.fleet_other, conf.bot.blaster_range)
 
-    # --- layer 1: heal the tank, fanned out around it. Chases the tank directly until
-    # close, then peels off to its own ray -- see `_approach`. ---
+    # --- layer 1: heal the tank, fanned out around it, facing away from the payload's
+    # current direction of travel (`back`) rather than a fixed heading -- see
+    # `_formation_back`. Chases the tank directly until close, then peels off to its
+    # own ray -- see `_approach`. ---
     if tank is not None:
-        for healer, direction in zip(layer1, _fan_directions(len(layer1), heal_max_dist, SAFE_SPACING)):
+        for healer, direction in zip(layer1, _fan_directions(back, len(layer1), heal_max_dist, SAFE_SPACING)):
             pos = tank.pos + direction * heal_max_dist
             bot_action = action.bots[healer.id]
             bot_action.move_action = move_bot(_approach(healer.pos, tank.pos, pos, heal_max_dist))
@@ -344,21 +410,25 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
             bot_action.special_action = SpecialAction.Healer(fire=True, target=tank.id)
 
     # --- layer 2: heal layer 1, 3 healers per layer-1 target, each group fanned out
-    # around its own parent the same way layer 1 fans around the tank. Also chases the
-    # tank first -- not its own (possibly still-arriving) parent -- since the tank is
-    # the one point everyone in the chain is converging on. ---
+    # around its own parent the same way layer 1 fans around the tank, and in the same
+    # `back` direction. Also chases the tank first -- not its own (possibly
+    # still-arriving) parent -- since the tank is the one point everyone in the chain
+    # is converging on. ---
     for group_start in range(0, len(layer2), 3):
         group = layer2[group_start:group_start + 3]
         parent = layer1[group_start // 3]
-        for healer, direction in zip(group, _fan_directions(len(group), heal_max_dist, SAFE_SPACING)):
+        for healer, direction in zip(group, _fan_directions(back, len(group), heal_max_dist, SAFE_SPACING)):
             pos = parent.pos + direction * heal_max_dist
             bot_action = action.bots[healer.id]
             bot_action.move_action = move_bot(_approach(healer.pos, tank.pos if tank is not None else parent.pos, pos, chain_reach))
             bot_action.turn_action = turn_towards(parent.pos)
             bot_action.special_action = SpecialAction.Healer(fire=True, target=parent.id)
 
-    # --- extractors: retire once there is nowhere left for the tokens to go, otherwise
-    # mine our own deposit wherever around it actually has a sightline ---
+    # --- extractors: retire once there is nowhere left for the tokens to go; flee
+    # instead of mining while the deposit is contested (any threat at all, small raid
+    # or heavy assault alike -- the defense force above is what's supposed to clear a
+    # small one, not the extractors themselves); otherwise mine wherever around the
+    # deposit actually has a sightline. ---
     if not _extraction_retired and extractor_count > 0 and battle_count + healer_count + extractor_count >= BOTS_MAX:
         # A full fleet silently refuses a rush without even charging for it, so once we
         # are capped, mining income has nothing left to buy. Only require enough for
@@ -371,6 +441,10 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     if _extraction_retired:
         for extractor in extractor_bots:
             action.bots[extractor.id].self_destruct = True
+    elif deposit_contested:
+        for extractor in extractor_bots:
+            bot_action = action.bots[extractor.id]
+            bot_action.move_action = move_bot(navigate_to(extractor.pos, tank.pos if tank is not None else state.deposit_me.pos))
     else:
         positions = _harvest_positions(conf, state.deposit_me.pos, extractor_count)
         for extractor, pos in zip(extractor_bots, positions):
@@ -378,6 +452,25 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
             bot_action.move_action = move_bot(_approach(extractor.pos, state.deposit_me.pos, pos, conf.bot.base_extract_range))
             bot_action.turn_action = turn_towards(state.deposit_me.pos)
             bot_action.special_action = SpecialAction.Extractor(mine=True)
+
+    # --- deposit defense force: sent to clear a small raid, one bigger than it. Just
+    # one group -- `needed_defenders` never exceeds SMALL_RAID_MAX + 1 -- so no need to
+    # split into `FOCUS_GROUP_SIZE` chunks the way the (much larger) tank guard group
+    # does. Falls back to its own nearest target if the shared one is not reachable
+    # from a particular defender's position, same as everywhere else. ---
+    if deposit_defenders:
+        claimed_targets: set = set()
+        target = _pick_group_target(state.deposit_me.pos, state.fleet_other, conf.bot.blaster_range, claimed_targets)
+        for bot in deposit_defenders:
+            bot_action = action.bots[bot.id]
+            bot_action.move_action = move_bot(navigate_to(bot.pos, state.deposit_me.pos))
+            if (target is not None
+                    and bot.pos.dist_sq(target.pos) <= conf.bot.blaster_range ** 2
+                    and line_of_sight(bot.pos, target.pos)):
+                bot_action.turn_action = turn_towards(target.pos)
+                bot_action.special_action = SpecialAction.Battle(fire=True)
+            else:
+                _engage_if_possible(bot_action, bot.pos, state.fleet_other, conf.bot.blaster_range)
 
     # --- general healers: once extraction has retired, roam to whichever standby
     # Battle bot -- tank guard or layer-2 guard -- is hurt worst. Nothing else heals
@@ -389,7 +482,7 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
             target = injured_order[i % len(injured_order)]
             groups.setdefault(target.id, (target, []))[1].append(healer)
         for target, healers_here in groups.values():
-            for healer, direction in zip(healers_here, _fan_directions(len(healers_here), heal_max_dist, SAFE_SPACING)):
+            for healer, direction in zip(healers_here, _fan_directions(back, len(healers_here), heal_max_dist, SAFE_SPACING)):
                 pos = target.pos + direction * heal_max_dist
                 bot_action = action.bots[healer.id]
                 bot_action.move_action = move_bot(_approach(healer.pos, tank.pos if tank is not None else target.pos, pos, chain_reach))
@@ -400,10 +493,12 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     # alive by layer 2's healing, but nothing heals layer 2 -- so guards split between
     # the tank (close range, catches anything that gets in melee-close to threaten the
     # tank and the nearby layer-1 healers) and layer 2 specifically (the chain's actual
-    # unguarded soft spot). Both groups stand just outside splash range of whoever they
-    # guard, and both chase the tank first while still far out, same as the healers, so
-    # the whole formation -- healers, guards, all of it -- can just walk together when
-    # the tank relocates with the payload. ---
+    # unguarded soft spot). The tank guard ring is a full circle -- it has no "wrong
+    # side" to fall onto the way a one-sided fan would, so it does not need `back` --
+    # but the rear guards orbit wherever their layer-2 healer actually is, so they
+    # follow the same `back`-oriented repositioning automatically. Both groups chase
+    # the tank first while still far out, same as the healers, so the whole formation
+    # can just walk together when the tank relocates with the payload. ---
     if tank is not None and standby_battle:
         tank_guards = standby_battle[:TANK_GUARD_COUNT]
         rear_guards = standby_battle[TANK_GUARD_COUNT:]
@@ -418,7 +513,7 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
         # does not buy (it is not simultaneous burst damage). A guard without its own
         # clear shot at the group's target falls back to its own nearest enemy instead
         # of sitting idle.
-        claimed_targets: set = set()
+        claimed_targets = set()
         for i in range(0, len(tank_guards), FOCUS_GROUP_SIZE):
             group = tank_guards[i:i + FOCUS_GROUP_SIZE]
             target = _pick_group_target(group[0].pos, state.fleet_other, conf.bot.blaster_range, claimed_targets)
@@ -455,7 +550,7 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
                 _engage_if_possible(bot_action, bot.pos, state.fleet_other, conf.bot.blaster_range)
 
     # --- fabricator ---
-    action.fabricator_next = int(_next_build_class(battle_count, healer_count, extractor_count, _extraction_retired))
+    action.fabricator_next = int(_next_build_class(battle_count, healer_count, extractor_count, _extraction_retired, not deposit_under_heavy_assault))
 
     # Rush whenever we can actually afford it, so the chain fills in as fast as tokens
     # allow instead of waiting on `conf.fabricator.interval`'s natural cadence. No bot is
