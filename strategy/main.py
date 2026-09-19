@@ -58,14 +58,22 @@ HEALER_TOTAL = HEALER_LAYER_1 + HEALER_LAYER_2  # 12
 GENERAL_HEALER_COUNT = 2  # extra floating healers, built only after extraction retires
 TANK_GUARD_COUNT = 4  # of the standby Battle bots, how many stay glued to the tank
 FOCUS_GROUP_SIZE = 4  # tank guards commit to one shared target per group this size
-SMALL_RAID_MAX = 2  # deposit threats at or below this get matched; above it, abandon
 CAPTURE_TANGENT_DELTA = 0.01  # capture-progress step used to sample the payload's heading
-# How long the deposit stays flagged as threatened after the last enemy is actually seen
-# near it. Without this the flag is recomputed from scratch against a hard range cutoff
-# every tick, so an enemy loitering right at the edge of it flips the flag on and off
-# repeatedly and the extractors visibly oscillate between fleeing and returning, mining
-# nothing either way. Also keeps the defense force's membership from churning.
-DEPOSIT_THREAT_MEMORY = 90
+DEPOSIT_GUARD_COUNT = 2  # Battle bots that escort the extractors from the start
+# Extractors bunch within this arc on the sheltered side of the deposit. Deliberately
+# tight -- the deposit is in the blaster scan mask, so it blocks shots, and hiding
+# behind it is worth more than the splash-spacing we keep everywhere else.
+DEPOSIT_COVER_ARC = 18.0
+
+# Center-rush abort. If this many enemies are inside blaster range of the formation
+# *and* healers are already dropping below half health, the chain is losing faster than
+# reinforcements can walk in, so it gives ground instead of dying in place: the tank
+# falls back along the payload path (everything else is anchored to the tank, so the
+# whole formation goes with it) toward our own side, where replacements arrive sooner.
+CENTER_RUSH_THRESHOLD = 5
+RETREAT_HURT_HEALERS = 2
+RETREAT_CAPTURE_STEP = 0.12  # how far back along the path to rally, in capture progress
+RETREAT_HOLD_TICKS = 240  # regroup for this long, then go contest again
 PAYLOAD_FLANKER_COUNT = 2  # standby bots posted off-axis to shoot into the payload's shadow
 # Where the flankers stand, as rotations off `back` (the direction the formation trails
 # in). Just the two flanks, deliberately not a post directly opposite the formation:
@@ -116,13 +124,8 @@ _extraction_retired = False
 # that are actually short.
 _healer_roles = {}
 
-# Deposit threat latch -- see `DEPOSIT_THREAT_MEMORY`. `_deposit_threat_until_tick` is
-# the tick the deposit stops counting as threatened if nothing new is seen before then,
-# and `_deposit_threat_count` remembers how big the last sighting was so the defense
-# force keeps the same size (and so the same bots stay assigned to it) across the gaps
-# where no enemy is momentarily inside the detection radius.
-_deposit_threat_until_tick = -1
-_deposit_threat_count = 0
+# The tick the center-rush retreat expires, if nothing re-triggers it before then.
+_retreat_until_tick = -1
 
 
 def do_nothing(state: GameState) -> FleetAction:
@@ -147,19 +150,23 @@ def get_strategy(team: int) -> Strategy:
     return heal_chain_strategy
 
 
-def _next_build_class(battle_count: int, healer_count: int, extractor_count: int, extraction_retired: bool, deposit_safe: bool) -> BotClass:
+def _next_build_class(battle_count: int, healer_count: int, extractor_count: int, extraction_retired: bool) -> BotClass:
     """The fabricator build order for this strategy, checked as a priority list: tank
-    first, then the first healer layer, then extractors (unless retired, or the deposit
-    is under a heavy assault we have decided to abandon -- see `heal_chain_strategy`),
-    then the second healer layer, then -- once extraction has retired -- the 2 general
-    healers, then Battle bots for as long as the fabricator keeps firing."""
+    first, then the first healer layer, then extractors (unless retired -- see
+    `heal_chain_strategy`), then the 2 Battle bots that escort them, then the second
+    healer layer, then -- once extraction has retired -- the 2 general healers, then
+    Battle bots for as long as the fabricator keeps firing."""
 
     if battle_count < TANK_COUNT:
         return BotClass.Battle
     if healer_count < HEALER_LAYER_1:
         return BotClass.Healer
-    if not extraction_retired and deposit_safe and extractor_count < EXTRACTOR_COUNT:
+    if not extraction_retired and extractor_count < EXTRACTOR_COUNT:
         return BotClass.Extractor
+    # The deposit escort comes right after the extractors it is meant to arrive with,
+    # rather than at the back of the queue behind 9 more healers.
+    if not extraction_retired and battle_count < TANK_COUNT + DEPOSIT_GUARD_COUNT:
+        return BotClass.Battle
     if healer_count < HEALER_TOTAL:
         return BotClass.Healer
     if extraction_retired and healer_count < HEALER_TOTAL + GENERAL_HEALER_COUNT:
@@ -221,7 +228,7 @@ def _ring_positions(center: Vec2, count: int, radius: float) -> List[Vec2]:
     return [center + RIGHT.rotate_deg(360.0 * i / count) * radius for i in range(count)]
 
 
-def _harvest_positions(conf: GameConfig, deposit_pos: Vec2, count: int) -> List[Vec2]:
+def _harvest_positions(conf: GameConfig, deposit_pos: Vec2, count: int, cover_dir: Optional[Vec2] = None) -> List[Vec2]:
     """`count` legal, mine-able spots around `deposit_pos`.
 
     An extractor's ray only needs `line_of_sight` to the deposit -- unlike the blaster
@@ -230,17 +237,24 @@ def _harvest_positions(conf: GameConfig, deposit_pos: Vec2, count: int) -> List[
     clear. A fixed offset put several extractors behind a wall with no shot at the
     deposit at all.
 
-    Aims each slot at an evenly spaced angle around the deposit first (so they spread
-    out when nothing is in the way), then, if that exact spot is blocked, tries nearby
-    angles at growing radii until it finds one that works.
+    With no `cover_dir`, aims each slot at an evenly spaced angle around the deposit so
+    they spread out. With one, bunches them all into a tight arc pointing that way
+    instead: the deposit is in the blaster's scan mask, so it blocks shots, and putting
+    the whole crew in its shadow is what buys them time to keep mining under fire.
+    Either way, if the exact spot is blocked it tries nearby angles at growing radii
+    until it finds one that actually has the sightline.
     """
     max_dist = conf.bot.base_extract_range - 2.0 * conf.bot.radius
     ring_step = 2.0 * conf.bot.radius + 0.2
     angle_jitters = [0.0, 20.0, -20.0, 40.0, -40.0, 60.0, -60.0, 80.0, -80.0, 100.0, -100.0]
+    cover_angle = cover_dir.angle_deg() if cover_dir is not None else None
 
     positions: List[Vec2] = []
     for i in range(count):
-        base_angle = 360.0 * i / count
+        if cover_angle is None:
+            base_angle = 360.0 * i / count
+        else:
+            base_angle = cover_angle + DEPOSIT_COVER_ARC * (i - (count - 1) / 2.0)
         spot = None
         radius = conf.deposit.radius + conf.bot.radius + 0.1
         while spot is None and radius <= max_dist:
@@ -380,6 +394,25 @@ def _assign_healer_roles(healer_bots: List[BotState]):
     for role in _healer_roles.values():
         counts[role] += 1
 
+    # Promote survivors inward to close gaps left by casualties, before considering new
+    # builds. Without this a dead layer-1 healer left layer 1 short until a brand-new
+    # bot finished walking across the map -- and layer 2 kept every member, so the
+    # layer-2-to-parent mapping had more groups than there were parents to hand them
+    # to. That was a hard IndexError crash, not a degradation, and it fired exactly
+    # when losses started mounting. Promoting also just plays better: an already-placed
+    # layer-2 healer is next to the tank in seconds, a fresh build is not.
+    for short, donor in (("layer1", "layer2"), ("layer2", "general")):
+        target_size = HEALER_LAYER_1 if short == "layer1" else HEALER_LAYER_2
+        while counts[short] < target_size and counts[donor] > 0:
+            for healer in sorted(healer_bots, key=lambda b: b.id):
+                if _healer_roles.get(healer.id) == donor:
+                    _healer_roles[healer.id] = short
+                    counts[donor] -= 1
+                    counts[short] += 1
+                    break
+            else:
+                break
+
     for healer in sorted(healer_bots, key=lambda b: b.id):
         if healer.id in _healer_roles:
             continue
@@ -399,7 +432,7 @@ def _assign_healer_roles(healer_bots: List[BotState]):
 
 
 def heal_chain_strategy(state: GameState) -> FleetAction:
-    global _extraction_retired, _deposit_threat_until_tick, _deposit_threat_count
+    global _extraction_retired, _retreat_until_tick
 
     conf = get_config()
     action = FleetAction.new()
@@ -437,38 +470,44 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     # heading for the tank to taking its own exact spot.
     chain_reach = 2.0 * heal_max_dist
 
-    # --- deposit defense: figure out who, if anyone, is threatening our extraction
-    # point before deciding what the extractors and the fabricator do this tick. An
-    # enemy within our own blaster range of the deposit can already shoot anything
-    # mining there. A small raid (<= SMALL_RAID_MAX) gets matched by a temporary strike
-    # force one bigger than it, pulled out of standby; anything larger and we cut our
-    # losses -- no new extractors while it holds, and the fabricator's capacity goes to
-    # Battle/Healer bots instead. ---
+    # --- deposit: no abandon logic any more. Extractors hold and mine until they die;
+    # the only concession to being shot at is where they stand. Whoever is threatening
+    # the deposit sets a cover direction -- the far side of the node from them -- and
+    # the crew bunches there, because the deposit is in the blaster's scan mask and so
+    # blocks shots outright. Two Battle bots escort them from the start. ---
     deposit_threats = [e for e in state.fleet_other
                         if state.deposit_me.pos.dist_sq(e.pos) <= conf.bot.blaster_range ** 2]
+    cover_dir = None
     if deposit_threats:
-        _deposit_threat_count = len(deposit_threats)
-        _deposit_threat_until_tick = state.tick + DEPOSIT_THREAT_MEMORY
-    elif state.tick > _deposit_threat_until_tick:
-        _deposit_threat_count = 0
-    threat_count = _deposit_threat_count
-    deposit_contested = threat_count > 0
-    deposit_under_heavy_assault = threat_count > SMALL_RAID_MAX
-    if deposit_contested and not deposit_under_heavy_assault:
-        needed_defenders = min(threat_count + 1, len(standby_battle))
-    else:
-        needed_defenders = 0
+        centroid = deposit_threats[0].pos
+        for enemy in deposit_threats[1:]:
+            centroid = centroid + enemy.pos
+        centroid = centroid * (1.0 / len(deposit_threats))
+        cover_dir = (state.deposit_me.pos - centroid).normalize_or_zero()
+        if cover_dir.norm_sq() == 0.0:
+            cover_dir = None
 
-    deposit_defenders: List[BotState] = []
-    if needed_defenders:
-        deposit_defenders = standby_battle[-needed_defenders:]
-        standby_battle = standby_battle[:len(standby_battle) - needed_defenders]
+    # --- center-rush abort: a big push landing on the formation while healers are
+    # already dropping means the chain loses faster than reinforcements can walk in, so
+    # give ground rather than feed it. The tank rallies back along the payload path
+    # toward our own side; everything else is positioned relative to the tank, so the
+    # whole formation withdraws with it. Latched for `RETREAT_HOLD_TICKS` so it is a
+    # decision, not a per-tick flinch, and bounded so we always go back to contest. ---
+    center_threats = sum(1 for e in state.fleet_other
+                         if payload.dist_sq(e.pos) <= conf.bot.blaster_range ** 2)
+    hurt_healers = sum(1 for h in healer_bots if h.health < conf.bot.health * 0.5)
+    if center_threats >= CENTER_RUSH_THRESHOLD and hurt_healers >= RETREAT_HURT_HEALERS:
+        _retreat_until_tick = state.tick + RETREAT_HOLD_TICKS
+    retreating = state.tick <= _retreat_until_tick
+    # Where the formation forms up: the payload normally, a point further back down the
+    # path while withdrawing.
+    center = payload_pos(max(-1.0, state.capture - RETREAT_CAPTURE_STEP)) if retreating else payload
 
     # --- the tank: hold (and, while uncontested, push) the payload ---
     if tank is not None:
         bot_action = action.bots[tank.id]
-        bot_action.move_action = move_bot(navigate_to(tank.pos, payload))
-        bot_action.turn_action = turn_towards(payload)
+        bot_action.move_action = move_bot(navigate_to(tank.pos, center))
+        bot_action.turn_action = turn_towards(center)
         _engage_if_possible(bot_action, tank.pos, state.fleet_other, conf.bot.blaster_range)
 
     # --- layer 1: heal the tank, fanned out around it, facing away from the payload's
@@ -488,9 +527,17 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     # `back` direction. Also chases the tank first -- not its own (possibly
     # still-arriving) parent -- since the tank is the one point everyone in the chain
     # is converging on. ---
-    for group_start in range(0, len(layer2), 3):
-        group = layer2[group_start:group_start + 3]
-        parent = layer1[group_start // 3]
+    # Round-robin across however many layer-1 parents are actually alive rather than
+    # slicing into fixed groups of 3 and indexing `layer1` by group number: that
+    # indexing assumed layer 1 was always full, and crashed outright the moment it was
+    # not. Spreading whatever layer 2 we have over whatever layer 1 we have degrades
+    # instead, which is what we want when the formation is already taking losses.
+    per_parent: List[List[BotState]] = [[] for _ in layer1]
+    for i, healer in enumerate(layer2):
+        if not layer1:
+            break  # no parents left alive at all -- nothing for layer 2 to attach to
+        per_parent[i % len(layer1)].append(healer)
+    for parent, group in zip(layer1, per_parent):
         for healer, direction in zip(group, _fan_directions(back, len(group), heal_max_dist, SAFE_SPACING)):
             pos = parent.pos + direction * heal_max_dist
             bot_action = action.bots[healer.id]
@@ -515,53 +562,16 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     if _extraction_retired:
         for extractor in extractor_bots:
             action.bots[extractor.id].self_destruct = True
-    elif deposit_contested:
-        # Retreat directly away from whoever is actually there, not toward the tank:
-        # the tank sits on the payload, which is mid-map or deeper, so "run to the
-        # tank" sent threatened extractors sprinting toward the most dangerous part of
-        # the board and frequently straight past the raiders they were fleeing.
-        #
-        # While the latch is up but nothing is currently in range (the enemy left, or
-        # is hovering just outside), hold position instead of drifting -- there is
-        # nothing to run from this tick, and drifting is what made this look jittery.
-        if deposit_threats:
-            centroid = deposit_threats[0].pos
-            for enemy in deposit_threats[1:]:
-                centroid = centroid + enemy.pos
-            centroid = centroid * (1.0 / len(deposit_threats))
-            for extractor in extractor_bots:
-                away = (extractor.pos - centroid).normalize_or_zero()
-                if away.norm_sq() == 0.0:
-                    away = back
-                bot_action = action.bots[extractor.id]
-                bot_action.move_action = move_bot(
-                    navigate_to(extractor.pos, extractor.pos + away * conf.bot.blaster_range))
     else:
-        positions = _harvest_positions(conf, state.deposit_me.pos, extractor_count)
+        # Mine until dead. No fleeing: running away just meant dying tired, and the
+        # rebuild-into-the-grinder loop was worse than holding. `cover_dir` puts the
+        # crew in the deposit's shot shadow when there is someone to hide from.
+        positions = _harvest_positions(conf, state.deposit_me.pos, extractor_count, cover_dir)
         for extractor, pos in zip(extractor_bots, positions):
             bot_action = action.bots[extractor.id]
             bot_action.move_action = move_bot(_approach(extractor.pos, state.deposit_me.pos, pos, conf.bot.base_extract_range))
             bot_action.turn_action = turn_towards(state.deposit_me.pos)
             bot_action.special_action = SpecialAction.Extractor(mine=True)
-
-    # --- deposit defense force: sent to clear a small raid, one bigger than it. Just
-    # one group -- `needed_defenders` never exceeds SMALL_RAID_MAX + 1 -- so no need to
-    # split into `FOCUS_GROUP_SIZE` chunks the way the (much larger) tank guard group
-    # does. Falls back to its own nearest target if the shared one is not reachable
-    # from a particular defender's position, same as everywhere else. ---
-    if deposit_defenders:
-        claimed_targets: set = set()
-        target = _pick_group_target(state.deposit_me.pos, state.fleet_other, conf.bot.blaster_range, claimed_targets)
-        for bot in deposit_defenders:
-            bot_action = action.bots[bot.id]
-            bot_action.move_action = move_bot(navigate_to(bot.pos, state.deposit_me.pos))
-            if (target is not None
-                    and bot.pos.dist_sq(target.pos) <= conf.bot.blaster_range ** 2
-                    and line_of_sight(bot.pos, target.pos)):
-                bot_action.turn_action = turn_towards(target.pos)
-                bot_action.special_action = SpecialAction.Battle(fire=True)
-            else:
-                _engage_if_possible(bot_action, bot.pos, state.fleet_other, conf.bot.blaster_range)
 
     # --- general healers: once extraction has retired, roam to whichever standby
     # Battle bot -- tank guard or layer-2 guard -- is hurt worst. Nothing else heals
@@ -591,9 +601,24 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     # the tank first while still far out, same as the healers, so the whole formation
     # can just walk together when the tank relocates with the payload. ---
     if tank is not None and standby_battle:
-        tank_guards = standby_battle[:TANK_GUARD_COUNT]
-        flankers = standby_battle[TANK_GUARD_COUNT:TANK_GUARD_COUNT + PAYLOAD_FLANKER_COUNT]
-        rear_guards = standby_battle[TANK_GUARD_COUNT + PAYLOAD_FLANKER_COUNT:]
+        # The escort is first in the queue so it is built alongside the extractors and
+        # travels out with them, rather than arriving after the deposit is already lost.
+        deposit_guards = standby_battle[:DEPOSIT_GUARD_COUNT]
+        rest = standby_battle[DEPOSIT_GUARD_COUNT:]
+        tank_guards = rest[:TANK_GUARD_COUNT]
+        flankers = rest[TANK_GUARD_COUNT:TANK_GUARD_COUNT + PAYLOAD_FLANKER_COUNT]
+        rear_guards = rest[TANK_GUARD_COUNT + PAYLOAD_FLANKER_COUNT:]
+
+        # Deposit escort: hold station on the deposit and shoot whatever comes for the
+        # extractors. Posted on the threatened side, between the raiders and the crew
+        # hiding behind the node.
+        guard_face = cover_dir * -1.0 if cover_dir is not None else back
+        for bot, pos in zip(deposit_guards,
+                            _ring_positions(state.deposit_me.pos + guard_face * (conf.deposit.radius + guard_standoff),
+                                            len(deposit_guards), guard_standoff)):
+            bot_action = action.bots[bot.id]
+            bot_action.move_action = move_bot(_approach(bot.pos, state.deposit_me.pos, pos, conf.bot.base_extract_range))
+            _engage_if_possible(bot_action, bot.pos, state.fleet_other, conf.bot.blaster_range)
 
         # --- payload flankers: the payload blocks blaster fire (it is in the scan mask,
         # unlike allies), so an enemy standing on the far side of it from our formation
@@ -605,9 +630,9 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
         # preference and fall back to normal engagement when it is empty. ---
         flank_radius = conf.payload.capture_radius + conf.bot.radius
         for bot, angle in zip(flankers, FLANKER_ANGLES):
-            post = payload + back.rotate_deg(angle) * flank_radius
+            post = center + back.rotate_deg(angle) * flank_radius
             bot_action = action.bots[bot.id]
-            bot_action.move_action = move_bot(_approach(bot.pos, payload, post, flank_radius * 2.0))
+            bot_action.move_action = move_bot(_approach(bot.pos, center, post, flank_radius * 2.0))
             zone_target = _pick_zone_target(bot.pos, state.fleet_other, payload,
                                             conf.payload.capture_radius, conf.bot.blaster_range)
             if zone_target is not None:
@@ -663,7 +688,7 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
                 _engage_if_possible(bot_action, bot.pos, state.fleet_other, conf.bot.blaster_range)
 
     # --- fabricator ---
-    action.fabricator_next = int(_next_build_class(battle_count, healer_count, extractor_count, _extraction_retired, not deposit_under_heavy_assault))
+    action.fabricator_next = int(_next_build_class(battle_count, healer_count, extractor_count, _extraction_retired))
 
     # Rush whenever we can actually afford it, so the chain fills in as fast as tokens
     # allow instead of waiting on `conf.fabricator.interval`'s natural cadence. No bot is
