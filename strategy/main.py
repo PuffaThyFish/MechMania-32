@@ -60,6 +60,21 @@ TANK_GUARD_COUNT = 4  # of the standby Battle bots, how many stay glued to the t
 FOCUS_GROUP_SIZE = 4  # tank guards commit to one shared target per group this size
 SMALL_RAID_MAX = 2  # deposit threats at or below this get matched; above it, abandon
 CAPTURE_TANGENT_DELTA = 0.01  # capture-progress step used to sample the payload's heading
+# How long the deposit stays flagged as threatened after the last enemy is actually seen
+# near it. Without this the flag is recomputed from scratch against a hard range cutoff
+# every tick, so an enemy loitering right at the edge of it flips the flag on and off
+# repeatedly and the extractors visibly oscillate between fleeing and returning, mining
+# nothing either way. Also keeps the defense force's membership from churning.
+DEPOSIT_THREAT_MEMORY = 90
+PAYLOAD_FLANKER_COUNT = 2  # standby bots posted off-axis to shoot into the payload's shadow
+# Where the flankers stand, as rotations off `back` (the direction the formation trails
+# in). Just the two flanks, deliberately not a post directly opposite the formation:
+# checked the geometry, and a shooter on either flank already clears the payload by
+# 1.3-2.4 units (vs its 0.75 radius) against anything anywhere on the far side, so the
+# opposite post adds no coverage -- and reaching it means walking through the enemy,
+# which in practice just got those bots killed in transit. Each flank also covers the
+# other's one blind spot, straight across the payload from it.
+FLANKER_ANGLES = (90.0, -90.0)
 
 # ####################################################################################
 # TESTING ONLY -- SET BACK TO False BEFORE `mm-cli submit`.
@@ -70,7 +85,7 @@ CAPTURE_TANGENT_DELTA = 0.01  # capture-progress step used to sample the payload
 # formation round the path's corners. Submitting with this on would hand every match
 # where we are seeded as team B to the opponent for free.
 # ####################################################################################
-IDLE_OPPONENT_FOR_TESTING = True
+IDLE_OPPONENT_FOR_TESTING = False
 
 # `LEFT` is the fallback formation heading for the rare tick where the payload's local
 # direction of travel cannot be sampled (see `formation_back`). Every unit sees itself
@@ -100,6 +115,14 @@ _extraction_retired = False
 # whatever role it already earned until it dies, and only lets new arrivals fill roles
 # that are actually short.
 _healer_roles = {}
+
+# Deposit threat latch -- see `DEPOSIT_THREAT_MEMORY`. `_deposit_threat_until_tick` is
+# the tick the deposit stops counting as threatened if nothing new is seen before then,
+# and `_deposit_threat_count` remembers how big the last sighting was so the defense
+# force keeps the same size (and so the same bots stay assigned to it) across the gaps
+# where no enemy is momentarily inside the detection radius.
+_deposit_threat_until_tick = -1
+_deposit_threat_count = 0
 
 
 def do_nothing(state: GameState) -> FleetAction:
@@ -301,6 +324,31 @@ def _pick_group_target(anchor: Vec2, enemies, blaster_range: float, claimed: set
     return best
 
 
+def _pick_zone_target(bot_pos: Vec2, enemies, zone_center: Vec2, zone_radius: float, blaster_range: float) -> Optional[BotState]:
+    """The nearest enemy inside the payload's capture zone that this bot can actually
+    shoot from where it stands.
+
+    The payload is in the blaster's scan mask (allies are not), so it blocks shots --
+    an enemy sitting on the far side of it from our formation cannot be hit at all,
+    which makes the payload a free shield for anyone contesting the zone. The flankers
+    that use this stand off-axis for exactly that reason, so what matters here is not
+    just range but the `line_of_sight` check: it is what confirms this particular bot
+    has an angle into the shadow rather than a view of the payload's near face."""
+    best = None
+    best_dist_sq = math.inf
+    zone_radius_sq = zone_radius * zone_radius
+    blaster_range_sq = blaster_range * blaster_range
+    for enemy in enemies:
+        if zone_center.dist_sq(enemy.pos) > zone_radius_sq:
+            continue
+        dist_sq = bot_pos.dist_sq(enemy.pos)
+        if dist_sq > blaster_range_sq or not line_of_sight(bot_pos, enemy.pos):
+            continue
+        if dist_sq < best_dist_sq:
+            best, best_dist_sq = enemy, dist_sq
+    return best
+
+
 def _engage_if_possible(bot_action: BotAction, bot_pos: Vec2, enemies, blaster_range: float) -> bool:
     """A single Battle bot's combat behavior: if there is a target in range with a
     clear shot, turn onto it and fire, overriding whatever facing its positional job
@@ -351,7 +399,7 @@ def _assign_healer_roles(healer_bots: List[BotState]):
 
 
 def heal_chain_strategy(state: GameState) -> FleetAction:
-    global _extraction_retired
+    global _extraction_retired, _deposit_threat_until_tick, _deposit_threat_count
 
     conf = get_config()
     action = FleetAction.new()
@@ -398,7 +446,12 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     # Battle/Healer bots instead. ---
     deposit_threats = [e for e in state.fleet_other
                         if state.deposit_me.pos.dist_sq(e.pos) <= conf.bot.blaster_range ** 2]
-    threat_count = len(deposit_threats)
+    if deposit_threats:
+        _deposit_threat_count = len(deposit_threats)
+        _deposit_threat_until_tick = state.tick + DEPOSIT_THREAT_MEMORY
+    elif state.tick > _deposit_threat_until_tick:
+        _deposit_threat_count = 0
+    threat_count = _deposit_threat_count
     deposit_contested = threat_count > 0
     deposit_under_heavy_assault = threat_count > SMALL_RAID_MAX
     if deposit_contested and not deposit_under_heavy_assault:
@@ -463,9 +516,26 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
         for extractor in extractor_bots:
             action.bots[extractor.id].self_destruct = True
     elif deposit_contested:
-        for extractor in extractor_bots:
-            bot_action = action.bots[extractor.id]
-            bot_action.move_action = move_bot(navigate_to(extractor.pos, tank.pos if tank is not None else state.deposit_me.pos))
+        # Retreat directly away from whoever is actually there, not toward the tank:
+        # the tank sits on the payload, which is mid-map or deeper, so "run to the
+        # tank" sent threatened extractors sprinting toward the most dangerous part of
+        # the board and frequently straight past the raiders they were fleeing.
+        #
+        # While the latch is up but nothing is currently in range (the enemy left, or
+        # is hovering just outside), hold position instead of drifting -- there is
+        # nothing to run from this tick, and drifting is what made this look jittery.
+        if deposit_threats:
+            centroid = deposit_threats[0].pos
+            for enemy in deposit_threats[1:]:
+                centroid = centroid + enemy.pos
+            centroid = centroid * (1.0 / len(deposit_threats))
+            for extractor in extractor_bots:
+                away = (extractor.pos - centroid).normalize_or_zero()
+                if away.norm_sq() == 0.0:
+                    away = back
+                bot_action = action.bots[extractor.id]
+                bot_action.move_action = move_bot(
+                    navigate_to(extractor.pos, extractor.pos + away * conf.bot.blaster_range))
     else:
         positions = _harvest_positions(conf, state.deposit_me.pos, extractor_count)
         for extractor, pos in zip(extractor_bots, positions):
@@ -522,7 +592,29 @@ def heal_chain_strategy(state: GameState) -> FleetAction:
     # can just walk together when the tank relocates with the payload. ---
     if tank is not None and standby_battle:
         tank_guards = standby_battle[:TANK_GUARD_COUNT]
-        rear_guards = standby_battle[TANK_GUARD_COUNT:]
+        flankers = standby_battle[TANK_GUARD_COUNT:TANK_GUARD_COUNT + PAYLOAD_FLANKER_COUNT]
+        rear_guards = standby_battle[TANK_GUARD_COUNT + PAYLOAD_FLANKER_COUNT:]
+
+        # --- payload flankers: the payload blocks blaster fire (it is in the scan mask,
+        # unlike allies), so an enemy standing on the far side of it from our formation
+        # is untouchable -- the payload works as a free shield for anyone contesting the
+        # zone. The tank and its guards are all bunched on one side, so that shadow is
+        # wide. These bots post off-axis instead -- directly opposite the formation
+        # first, then the two flanks -- just outside the capture radius, so between them
+        # every angle into the zone is covered by somebody. They shoot into the zone by
+        # preference and fall back to normal engagement when it is empty. ---
+        flank_radius = conf.payload.capture_radius + conf.bot.radius
+        for bot, angle in zip(flankers, FLANKER_ANGLES):
+            post = payload + back.rotate_deg(angle) * flank_radius
+            bot_action = action.bots[bot.id]
+            bot_action.move_action = move_bot(_approach(bot.pos, payload, post, flank_radius * 2.0))
+            zone_target = _pick_zone_target(bot.pos, state.fleet_other, payload,
+                                            conf.payload.capture_radius, conf.bot.blaster_range)
+            if zone_target is not None:
+                bot_action.turn_action = turn_towards(zone_target.pos)
+                bot_action.special_action = SpecialAction.Battle(fire=True)
+            else:
+                _engage_if_possible(bot_action, bot.pos, state.fleet_other, conf.bot.blaster_range)
 
         tank_guard_positions = _ring_positions(tank.pos, len(tank_guards), guard_standoff)
         for bot, pos in zip(tank_guards, tank_guard_positions):
