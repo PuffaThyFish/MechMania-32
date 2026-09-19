@@ -1,5 +1,36 @@
 from . import *
 
+# -------------------------------------------------------------------------------------
+# Heal-chain payload stall -- v1
+#
+# The plan:
+#   1. One Battle bot ("the tank") heads straight for the payload and parks in the
+#      capture zone. Alone there, it pushes the payload toward the enemy goal every
+#      tick -- free progress, and banks us the `PayloadProgress` tiebreak -- until an
+#      enemy shows up to contest, at which point the zone freezes completely (see
+#      `step_payload`: any nonzero count on both sides holds position outright,
+#      regardless of how many bots either side has).
+#   2. 3 Healers (layer 1) go heal the tank. `heal_stack_cap` is 3.0, i.e. exactly 3
+#      healers' worth of healing lands on one target -- a 4th healer on the same bot
+#      would be wasted, which is why layer 1 stops at 3.
+#   3. 5 Extractors mine our own deposit for income.
+#   4. 9 more Healers (layer 2), 3 per layer-1 healer, so each layer-1 healer is itself
+#      protected by a full 3-healer stack.
+#   5. Everything built after that is a Battle bot held on standby (no orders yet --
+#      just sits at spawn). Real behavior (rally point, counter-push, defense) comes in
+#      a later iteration.
+#
+# This is a first pass on purpose: role assignment is by rank (Nth-smallest id within a
+# class), not a persistent assignment, so a dead tank/healer is transparently replaced
+# by whichever surviving bot of that class now has the lowest id. No formation spacing,
+# no retreat/regroup logic, no reaction to what the enemy is doing yet.
+
+TANK_COUNT = 1
+HEALER_LAYER_1 = 3
+EXTRACTOR_COUNT = 5
+HEALER_LAYER_2 = 9
+HEALER_TOTAL = HEALER_LAYER_1 + HEALER_LAYER_2  # 12
+
 
 def get_strategy(team: int) -> Strategy:
     """This function tells the engine what strategy you want your bot to use."""
@@ -7,110 +38,89 @@ def get_strategy(team: int) -> Strategy:
     # team == 0 means I am bottom left
     # team == 1 means I am top right
 
-    if team == 0:
-        print("Hello! I am team A (on the bottom left)")
-        return basic_strategy
-    else:
-        print("Hello! I am team B (on the top right)")
-        return do_nothing
+    # Same strategy both sides: the engine mirrors the world for team B, so there is
+    # nothing for a side to specialize in.
+    print(f"Hello! I am team {'A (bottom left)' if team == 0 else 'B (top right)'}")
+    return heal_chain_strategy
 
-    # NOTE when actually submitting your bot, you probably want to have the SAME strategy
-    # for both sides: the engine mirrors the world for the top-right team, so there is
-    # nothing for a side to specialise in.
 
-def do_nothing(state: GameState) -> FleetAction:
-    """The smallest strategy there is: issue no orders at all."""
-    return FleetAction.new()
+def _next_build_class(battle_count: int, healer_count: int, extractor_count: int) -> BotClass:
+    """The fabricator build order for this strategy, checked as a priority list: tank
+    first, then the first healer layer, then extractors, then the second healer layer,
+    then Battle bots for as long as the fabricator keeps firing."""
 
-def basic_strategy(state: GameState) -> FleetAction:
-    """Assign one bot to extract from our deposit, one bot to hold the payload, and send
-    every remaining bot after the nearest enemy."""
+    if battle_count < TANK_COUNT:
+        return BotClass.Battle
+    if healer_count < HEALER_LAYER_1:
+        return BotClass.Healer
+    if extractor_count < EXTRACTOR_COUNT:
+        return BotClass.Extractor
+    if healer_count < HEALER_TOTAL:
+        return BotClass.Healer
+    return BotClass.Battle
 
-    # NOTE `get_config()` is the whole rulebook for this match -- bot stats, payload
-    # speed, deposit layout, fabricator prices, the map. It is fixed for the match and
-    # available from the first tick, so read it instead of hardcoding numbers: the values
-    # below are tuned between seasons and your bot picks up the change for free.
+
+def heal_chain_strategy(state: GameState) -> FleetAction:
     conf = get_config()
-
-    # NOTE Do not worry about what side your bot is on!
-    # The engine mirrors the world for you if you are on top,
-    # so to you, you are always on the bottom left. Your fleet is always `fleet_me`.
-
     action = FleetAction.new()
-
     payload = state.payload_pos()
 
-    # make a battle bot by default
-    next_bot = BotClass.Battle
+    battle_bots = sorted((b for b in state.fleet_me if b.class_ == BotClass.Battle), key=lambda b: b.id)
+    healer_bots = sorted((b for b in state.fleet_me if b.class_ == BotClass.Healer), key=lambda b: b.id)
+    extractor_bots = [b for b in state.fleet_me if b.class_ == BotClass.Extractor]
 
-    # `next_bot_creation: 0` means both fleets' very first build is always a Extractor
-    # (the engine's own default), and that first bot always lands in slot 0 -- so bot id 0
-    # missing means our extractor died and the fabricator should replace it before anything
-    # else.
-    if not state.fleet_me.get(0):
-        next_bot = BotClass.Extractor
+    tank = battle_bots[0] if battle_bots else None
+    layer1 = healer_bots[:HEALER_LAYER_1]
+    layer2 = healer_bots[HEALER_LAYER_1:HEALER_TOTAL]
+    standby_battle = battle_bots[1:]
 
-    # The deposit is a solid disc, so standing dead-center is not the mining spot. This is
-    # the closest legal spot on our own edge of the ring: hull to hull with it, `+y` being
-    # the side away from the map center on our half.
-    #
-    # You do not actually have to hug the ring -- an extractor mines anything within
-    # `conf.bot.base_extract_range` that it has a sightline to (`line_of_sight`), and only
-    # walls block that ray, not bots. Standing back is safer.
+    # The deposit is a solid disc, so standing dead-center is not the mining spot. This
+    # is the closest legal spot on our own edge of the ring: hull to hull with it, `+y`
+    # being the side away from the map center on our half.
     mining_spot = state.deposit_me.pos + Vec2(0.0, conf.deposit.radius + conf.bot.radius)
 
-    assigned_contester = False
+    # --- the tank: hold (and, while uncontested, push) the payload ---
+    if tank is not None:
+        bot_action = action.bots[tank.id]
+        bot_action.move_action = move_bot(navigate_to(tank.pos, payload))
+        bot_action.turn_action = turn_towards(payload)
 
-    for bot in state.fleet_me:
+    # --- layer 1: heal the tank ---
+    if tank is not None:
+        for healer in layer1:
+            bot_action = action.bots[healer.id]
+            bot_action.move_action = move_bot(navigate_to(healer.pos, tank.pos))
+            bot_action.turn_action = turn_towards(tank.pos)
+            bot_action.special_action = SpecialAction.Healer(fire=True, target=tank.id)
 
-        # `fleet_me` iterates the bots you actually have -- dead slots are skipped, so there
-        # is no mask to check and no empty slot to guard against. `FleetAction.bots` is
-        # indexed by bot id, and a bot's id is its slot.
-        bot_action = action.bots[bot.id]
+    # --- layer 2: heal layer 1, 3 healers per layer-1 target ---
+    for i, healer in enumerate(layer2):
+        target = layer1[i // 3]
+        bot_action = action.bots[healer.id]
+        bot_action.move_action = move_bot(navigate_to(healer.pos, target.pos))
+        bot_action.turn_action = turn_towards(target.pos)
+        bot_action.special_action = SpecialAction.Healer(fire=True, target=target.id)
 
-        if bot.class_ == BotClass.Extractor:
-            bot_action.move_action = move_bot(navigate_to(bot.pos, mining_spot))
-            bot_action.turn_action = turn_towards(state.deposit_me.pos)
-            bot_action.special_action = SpecialAction.Extractor(mine=True)
-            continue
+    # --- extractors: mine our own deposit ---
+    for extractor in extractor_bots:
+        bot_action = action.bots[extractor.id]
+        bot_action.move_action = move_bot(navigate_to(extractor.pos, mining_spot))
+        bot_action.turn_action = turn_towards(state.deposit_me.pos)
+        bot_action.special_action = SpecialAction.Extractor(mine=True)
 
-        if not assigned_contester:
-            # NOTE You do not have to write a pathfinder. `navigate_to` walks around walls
-            # for you, using a map of the arena the engine works out before the match
-            # starts. Call it every tick with where the bot is now -- it is one step, not a
-            # plan, so it re-routes by itself as things move.
-            #
-            # `payload - bot.pos` would walk straight at the point and grind into the first
-            # wall in the way.
-            bot_action.move_action = move_bot(navigate_to(bot.pos, payload))
-            assigned_contester = True
-            continue
+    # --- standby Battle bots: no orders yet, they just sit at their spawn point ---
+    # TODO: give these something to do once the chain above is stable -- a rally point,
+    # a counter-push trigger, or defense for the healer chain.
 
-        # find the closest enemy
-        closest_enemy = None
-        for enemy in state.fleet_other:
-            if closest_enemy is None or bot.pos.dist_sq(enemy.pos) < bot.pos.dist_sq(closest_enemy):
-                closest_enemy = enemy.pos
+    # --- fabricator ---
+    battle_count = len(battle_bots)
+    healer_count = len(healer_bots)
+    extractor_count = len(extractor_bots)
+    action.fabricator_next = int(_next_build_class(battle_count, healer_count, extractor_count))
 
-        if closest_enemy is None:
-            break
-        bot_action.move_action = move_bot(navigate_to(bot.pos, closest_enemy))
-        bot_action.turn_action = turn_towards(closest_enemy)
-
-        # Only pull the trigger when the shot can actually land: in range, and with a wall
-        # free sightline. A shot puts the blaster on `conf.bot.blaster_cooldown` ticks
-        # whether or not it hits anything, so firing at a wall costs you the next real one.
-        in_range = (bot.pos.dist(closest_enemy) <= conf.bot.blaster_range
-                    and line_of_sight(bot.pos, closest_enemy))
-        bot_action.special_action = SpecialAction.Battle(fire=in_range)
-
-    action.fabricator_next = int(next_bot)
-
-    # Rush orders are the only thing tokens buy. Ask for one when we can actually pay
-    # `conf.fabricator.rush_cost`, and not once the endgame has started -- no bot is built
-    # in the last `conf.endgame_ticks` of the match, so the tokens would just sit there.
-    #
-    # Rust's `GameState::in_endgame(conf)` has no Python binding, so spell the phase out.
+    # Rush whenever we can actually afford it, so the chain fills in as fast as tokens
+    # allow instead of waiting on `conf.fabricator.interval`'s natural cadence. No bot is
+    # built in the endgame, so do not bother asking then.
     in_endgame = state.tick >= conf.max_ticks - conf.endgame_ticks
     action.rush_order = (not in_endgame
                          and state.fabricator_me.tokens >= conf.fabricator.rush_cost)
