@@ -61,6 +61,17 @@ FOCUS_GROUP_SIZE = 4  # tank guards commit to one shared target per group this s
 SMALL_RAID_MAX = 2  # deposit threats at or below this get matched; above it, abandon
 CAPTURE_TANGENT_DELTA = 0.01  # capture-progress step used to sample the payload's heading
 
+# ####################################################################################
+# TESTING ONLY -- SET BACK TO False BEFORE `mm-cli submit`.
+#
+# Makes team B sit still and issue no orders, so a local `mm-cli run` shows this bot
+# operating completely unobstructed: the payload actually travels (in a mirrored match
+# both sides contest it and it never moves at all), which is the only way to watch the
+# formation round the path's corners. Submitting with this on would hand every match
+# where we are seeded as team B to the opponent for free.
+# ####################################################################################
+IDLE_OPPONENT_FOR_TESTING = True
+
 # `LEFT` is the fallback formation heading for the rare tick where the payload's local
 # direction of travel cannot be sampled (see `formation_back`). Every unit sees itself
 # as bottom-left (the engine mirrors team B's world), so a fixed "toward the map edge"
@@ -91,14 +102,24 @@ _extraction_retired = False
 _healer_roles = {}
 
 
+def do_nothing(state: GameState) -> FleetAction:
+    """Issue no orders at all. Only used as the idle sparring partner -- see
+    `IDLE_OPPONENT_FOR_TESTING`."""
+    return FleetAction.new()
+
+
 def get_strategy(team: int) -> Strategy:
     """This function tells the engine what strategy you want your bot to use."""
 
     # team == 0 means I am bottom left
     # team == 1 means I am top right
 
-    # Same strategy both sides: the engine mirrors the world for team B, so there is
-    # nothing for a side to specialize in.
+    if IDLE_OPPONENT_FOR_TESTING and team == 1:
+        print("Hello! I am team B (top right) -- IDLE, for testing only")
+        return do_nothing
+
+    # Otherwise the same strategy both sides: the engine mirrors the world for team B,
+    # so there is nothing for a side to specialize in.
     print(f"Hello! I am team {'A (bottom left)' if team == 0 else 'B (top right)'}")
     return heal_chain_strategy
 
